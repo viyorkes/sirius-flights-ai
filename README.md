@@ -50,8 +50,8 @@ Claude formats natural language response
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/flight-search-ai-chat
-cd flight-search-ai-chat
+git clone https://github.com/viyorkes/sirius-flights-ai
+cd sirius-flights-ai
 
 # Create virtual environment
 python -m venv venv
