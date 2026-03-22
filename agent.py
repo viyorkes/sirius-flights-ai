@@ -1,9 +1,8 @@
-import json
+from datetime import datetime
 from typing import AsyncGenerator
 from langchain_anthropic import ChatAnthropic
 from langchain.agents import AgentExecutor, create_tool_calling_agent
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain.memory import ConversationBufferWindowMemory
 from langchain_core.messages import HumanMessage, AIMessage
 from tools.registry import get_tools
 from rag.retriever import query_knowledge_base
@@ -12,23 +11,38 @@ from exceptions import AgentError
 
 settings = get_settings()
 
-# In-memory session store
-# Java equivalent: private static Map<String, List<Message>> sessions = new HashMap<>();
 sessions: dict = {}
 
 
 def get_or_create_session(session_id: str) -> list:
-    """Returns existing session history or creates a new one."""
     if session_id not in sessions:
         sessions[session_id] = []
     return sessions[session_id]
 
 
+def extract_output(result: dict) -> str:
+    """Extracts string output from agent result regardless of format."""
+    output = result.get("output", "")
+    if isinstance(output, list):
+        return " ".join([
+            item.get("text", "")
+            for item in output
+            if isinstance(item, dict) and item.get("type") == "text"
+        ])
+    return str(output)
+
+
+def extract_tools_used(result: dict) -> list:
+    """Extracts list of tools used from intermediate steps."""
+    tools_used = []
+    if "intermediate_steps" in result:
+        for action, _ in result["intermediate_steps"]:
+            if hasattr(action, "tool") and action.tool not in tools_used:
+                tools_used.append(action.tool)
+    return tools_used
+
+
 def build_agent():
-    """
-    Builds and returns the LangChain agent with tools.
-    Called once per request — stateless agent, stateful memory via sessions.
-    """
     llm = ChatAnthropic(
         model=settings.model,
         anthropic_api_key=settings.anthropic_api_key,
@@ -40,19 +54,20 @@ def build_agent():
     prompt = ChatPromptTemplate.from_messages([
         (
             "system",
-            """You are Sirius, an intelligent flight search assistant powered by AI.
+            f"""You are Sirius, an intelligent flight search assistant powered by AI.
 You help users find the best flights, compare prices, and plan their trips.
+
+Today's date is {datetime.now().strftime('%Y-%m-%d')}.
 
 Guidelines:
 - Always use tools to search for real flight data — never make up prices or schedules
 - Use IATA airport codes (GRU, JFK, LHR, CDG) when calling tools
 - When user mentions a city, convert to the main airport IATA code
+- Always use future dates when searching for flights
 - Always present prices clearly with currency
 - Suggest alternatives when no exact match is found
 - Be concise, friendly and helpful
-- If the user asks about travel tips, visa info or destination advice, use your knowledge base
-
-Today's date context: you are helping users plan future travel."""
+- If the user asks about travel tips, visa info or destination advice, use your knowledge base"""
         ),
         MessagesPlaceholder(variable_name="chat_history"),
         ("human", "{input}"),
@@ -66,25 +81,21 @@ Today's date context: you are helping users plan future travel."""
         tools=tools,
         verbose=True,
         max_iterations=5,
-        handle_parsing_errors=True
+        handle_parsing_errors=True,
+        return_intermediate_steps=True
     )
 
 
 def run_agent(message: str, session_id: str = "default") -> dict:
-    """
-    Runs the agent synchronously.
-    Returns the full response with tools used.
-    """
     try:
         history = get_or_create_session(session_id)
         agent_executor = build_agent()
 
-        # Try to enrich with RAG context
         rag_context = ""
         try:
             rag_context = query_knowledge_base(message)
         except Exception:
-            pass  # RAG is optional — agent works without it
+            pass
 
         enriched_message = message
         if rag_context:
@@ -95,18 +106,19 @@ def run_agent(message: str, session_id: str = "default") -> dict:
             "chat_history": history
         })
 
-        # Update session history
-        history.append(HumanMessage(content=message))
-        history.append(AIMessage(content=result["output"]))
+        output = extract_output(result)
+        tools_used = extract_tools_used(result)
 
-        # Keep last 10 messages only
+        history.append(HumanMessage(content=message))
+        history.append(AIMessage(content=output))
+
         if len(history) > 10:
             sessions[session_id] = history[-10:]
 
         return {
-            "reply": result["output"],
+            "reply": output,
             "session_id": session_id,
-            "tools_used": []
+            "tools_used": tools_used
         }
 
     except Exception as e:
@@ -117,10 +129,6 @@ def run_agent(message: str, session_id: str = "default") -> dict:
 
 
 async def stream_agent(message: str, session_id: str = "default") -> AsyncGenerator[str, None]:
-    """
-    Runs the agent with streaming — yields chunks as they arrive.
-    Used by the SSE endpoint in main.py.
-    """
     try:
         history = get_or_create_session(session_id)
 
@@ -136,9 +144,11 @@ async def stream_agent(message: str, session_id: str = "default") -> AsyncGenera
         prompt = ChatPromptTemplate.from_messages([
             (
                 "system",
-                """You are Sirius, an intelligent flight search assistant.
+                f"""You are Sirius, an intelligent flight search assistant.
+Today's date is {datetime.now().strftime('%Y-%m-%d')}.
 Use the available tools to search for real flight data.
 Always use IATA airport codes when calling tools.
+Always use future dates when searching.
 Be concise, friendly and helpful."""
             ),
             MessagesPlaceholder(variable_name="chat_history"),
@@ -152,10 +162,10 @@ Be concise, friendly and helpful."""
             tools=tools,
             verbose=False,
             max_iterations=5,
-            handle_parsing_errors=True
+            handle_parsing_errors=True,
+            return_intermediate_steps=True
         )
 
-        # Try RAG enrichment
         rag_context = ""
         try:
             rag_context = query_knowledge_base(message)
@@ -173,10 +183,15 @@ Be concise, friendly and helpful."""
         ):
             if "output" in chunk:
                 token = chunk["output"]
+                if isinstance(token, list):
+                    token = " ".join([
+                        item.get("text", "")
+                        for item in token
+                        if isinstance(item, dict) and item.get("type") == "text"
+                    ])
                 full_response += token
                 yield token
 
-        # Update session history
         history.append(HumanMessage(content=message))
         history.append(AIMessage(content=full_response))
 
